@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+# MIT License
+# (c) 2025 Giampiero Grossi
+"""
+CliNO seasonal HLI mapping (0.25° global) with welfare categories.
+
+Inputs:
+  - --shapefile        : path to 'ne_110m_admin_0_countries.shp' (or similar) https://www.naturalearthdata.com/
+  - --base_directory   : path to "Dataset/HLI_CliNO_Season_file_nc/CliNO"
+Outputs:
+  - <OUT>/HLI_welfare_CliNO_seasonal_maps.tif/.eps/.png
+
+Usage:
+  python cliNO_map.py --baseline-dir /path/Dataset/HLI_CliNO_Season_file_nc/CliNO \
+                      --shape /path/ne_110m_admin_0_countries.shp \
+                      --out ./figures --dpi 600 --format tiff
+"""
+
+
+
+import netCDF4 as nc
+import numpy as np
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import os
+import geopandas as gpd
+from shapely.geometry import mapping
+from rasterio import features
+from affine import Affine
+from matplotlib.colors import ListedColormap, BoundaryNorm
+
+# Function to extract data from NetCDF files
+def extract_data_from_nc(file_path, variable_name):
+    with nc.Dataset(file_path, 'r') as dataset:
+        lats = dataset.variables['lat'][:]
+        lons = dataset.variables['lon'][:]
+        data = dataset.variables[variable_name][:]
+    return lats, lons, data
+
+# Function to create a raster mask of land areas
+def create_land_mask(lats, lons):
+    shapefile_path = "Your path.../ne_110m_admin_0_countries/ne_110m_admin_0_countries.shp"
+    world = gpd.read_file(shapefile_path)
+    land_geom = [mapping(world.geometry.union_all())]
+    x_res = (lons[-1] - lons[0]) / (len(lons) - 1)
+    y_res = (lats[-1] - lats[0]) / (len(lats) - 1)
+    transform = Affine.translation(
+        lons[0] - x_res / 2, lats[0] - y_res / 2
+    ) * Affine.scale(x_res, y_res)
+    mask = features.rasterize(
+        shapes=land_geom,
+        out_shape=(len(lats), len(lons)),
+        transform=transform,
+        fill=0,
+        default_value=1,
+        dtype=np.uint8
+    )
+    return mask
+
+# Function to apply the land area mask to the data
+def apply_land_mask(data, land_mask):
+    return np.where(land_mask == 1, data, np.nan)
+
+# Function to create a subplot for each season
+def create_seasonal_subplot(ax, lats, lons, data, title, vmin, vmax):
+    ax.set_title(title, fontsize=16, fontfamily='serif')
+    ax.coastlines(linewidth=0.4)
+    gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.5, linestyle='--')
+    gl.top_labels = False
+    gl.right_labels = False
+    gl.xlabel_style = {'size': 10, 'color': 'black', 'fontfamily': 'Times New Roman'}
+    gl.ylabel_style = {'size': 10, 'color': 'black', 'fontfamily': 'Times New Roman'}
+    ax.set_extent([-180, 180, -60, 90], crs=ccrs.PlateCarree())
+    im = ax.pcolormesh(
+        lons, lats, data,
+        cmap=cmap,
+        norm=norm,
+        shading='auto',
+        transform=ccrs.PlateCarree()
+    )
+    return im
+
+# Main function to create the figure with all seasonal maps for CliNO
+def main():
+    base_directory = "Your path...Dataset/HLI_CliNO_Season_file_nc/CliNO"
+    seasons = ['DJF', 'MAM', 'JJA', 'SON']
+    variable_name = 'HLI'
+
+    # Extract data for each season
+    data_dict = {}
+    for season in seasons:
+        file_path = os.path.join(base_directory, f'average_{variable_name}_data_{season}_1985_2014.nc')
+        lats, lons, data = extract_data_from_nc(file_path, variable_name)
+        data_dict[season] = data
+
+    # Create the land mask
+    land_mask = create_land_mask(lats, lons)
+
+    # Apply land mask to all data
+    for season in seasons:
+        data_dict[season] = apply_land_mask(data_dict[season], land_mask)
+
+    # Definisci le nuove categorie di HLI e i colori corrispondenti
+    max_value = np.nanmax([np.nanmax(data_dict[season]) for season in seasons])
+    categories = [0, 70, 77, 86, 96, max_value + 1]
+    colors = ['#4CAF50', '#FFEB3B', '#FF9800', '#B71C1C', '#380000']
+    
+    # Crea una mappa di colori personalizzata
+    global cmap, norm
+    cmap = ListedColormap(colors)
+    norm = BoundaryNorm(categories, cmap.N)
+
+    # Create the figure and axes for the seasonal maps
+    fig, axes = plt.subplots(nrows=1, ncols=4, figsize=(20, 4), subplot_kw={'projection': ccrs.PlateCarree()})
+    #fig.suptitle('Livestock welfare categories for CliNO period', fontsize=24, fontfamily='Times New Roman', x=0.55, y=0.77)
+
+    # Spacing parameters for customization
+    vertical_space = 0.15
+    ssp_label_distance = -0.15
+    colorbar_distance = 0.09
+    colorbar_shift_right = 0.04
+
+    # Create subplots for each season
+    for col, season in enumerate(seasons):
+        ax = axes[col]
+        im = create_seasonal_subplot(ax, lats, lons, data_dict[season], title=season, vmin=categories[0], vmax=categories[-2])
+        if col == 0:
+            ax.text(ssp_label_distance, 0.5, 'CliNo', va='center', ha='right', fontsize=16, fontweight='bold', rotation='vertical', transform=ax.transAxes, fontfamily='serif')
+
+    # Add a single color bar for all subplots
+    cbar_ax = fig.add_axes([0.20 + colorbar_shift_right, colorbar_distance, 0.6, 0.05])
+    cbar = fig.colorbar(im, cax=cbar_ax, orientation='horizontal', ticks=[(categories[i] + categories[i+1]) / 2 for i in range(len(categories)-1)])
+    cbar.set_label('Welfare categories', fontsize=16, fontfamily='Times New Roman')
+    cbar.ax.tick_params(labelsize=14)
+    cbar.set_ticklabels([
+    'HLI ≤ 70',
+    '70 < HLI ≤ 77',
+    '77 < HLI ≤ 86',
+    '86 < HLI ≤ 96',
+    'HLI > 96'
+])
+
+    plt.tight_layout(rect=[0.05, 0.1, 1, 0.95 - vertical_space])
+    plt.savefig(f'{variable_name}_welfare_CliNO_seasonal_maps.tiff', dpi=600, bbox_inches='tight')
+    plt.show()
+
+if __name__ == "__main__":
+    main()
