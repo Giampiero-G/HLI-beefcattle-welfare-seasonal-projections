@@ -11,8 +11,8 @@ Outputs:
   - <OUT>/HLI_welfare_CliNO_seasonal_maps.tif/.eps/.png
 
 Usage:
-  python cliNO_map.py --baseline-dir /path/Dataset/HLI_CliNO_Season_file_nc/CliNO \
-                      --shape /path/ne_110m_admin_0_countries.shp \
+  python cliNO_map.py --baseline-dir /path/Dataset/HLI_CliNO_Season_file_nc/CliNO
+                      --shape /path/ne_110m_admin_0_countries.shp
                       --out ./figures --dpi 600 --format tiff
 """
 
