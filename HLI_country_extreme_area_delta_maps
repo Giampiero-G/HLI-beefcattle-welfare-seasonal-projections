@@ -1,0 +1,445 @@
+import os
+import netCDF4 as nc
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+import cartopy.crs as ccrs
+import geopandas as gpd
+from rasterio import features
+from affine import Affine
+
+"""
+Script: HLI_country_extreme_area_delta_maps.py
+
+Purpose
+-------
+Produce country-level maps of the change in national land area
+exposed to extreme heat stress (HLI > threshold) between a
+baseline climatological period (1985–2014, "CliNo") and a selected
+future period, for multiple SSP scenarios and seasons.
+
+For each combination of:
+  - SSP scenario (SSP1-2.6, SSP2-4.5, SSP3-7.0, SSP5-8.5),
+  - season (DJF, MAM, JJA, SON),
+
+the script:
+
+  1. Computes, for each country polygon, the fraction of its land
+     area where HLI exceeds a given threshold (here 96) in the
+     CliNo baseline.
+  2. Computes the same fraction for a future 25-year climatology.
+  3. Calculates the difference in percentage points (future – baseline).
+  4. Plots a 4×4 panel (rows = SSPs, columns = seasons) where each
+     country is colored by this percentage-point change.
+
+Inputs
+------
+- Baseline seasonal HLI NetCDF files:
+    baseline_dir/average_HLI_data_{SEASON}_1985_2014.nc
+
+- Projection seasonal HLI NetCDF files for a *single* period:
+    projection_dir/{SSP}/projection_HLI_data_{SEASON}_{period_label}.nc
+
+- Global country shapefile (Natural Earth or equivalent):
+    shapefile_path
+
+Outputs
+-------
+- A single multi-panel figure saved as:
+    HLI_severe_area_delta_{period_label}.png
+
+  showing, for each (SSP, season), the country-level increase
+  in the share of national land with HLI above the threshold,
+  expressed in percentage points.
+
+Notes
+-----
+- HLI threshold is set here to 96, so the maps correspond to
+  the “extreme heat stress” welfare category (HLI > 96).
+- Percentages are computed relative to terrestrial area within
+  each country polygon, based on a spherical Earth approximation
+  with radius 6,371 km.
+"""
+
+# ============================================================
+# === USER CONFIGURATION =====================================
+# ============================================================
+
+# Directory with CliNo (baseline) seasonal HLI files
+baseline_dir = r"//truenas/dati/Mappe THI e HLI/HLI_CliNO_Season_file_nc/CliNO"
+
+# Directory with projection files for ONE time period
+projection_dir = r"//truenas/dati/Mappe THI e HLI/HLI_Projections_file_nc_2026-2050"
+period_label = "2026_2050"   # e.g. "2026_2050", "2051_2075", "2076_2100"
+
+# SSP subfolders inside projection_dir
+ssp_dirs = ['SSP1-2.6', 'SSP2-4.5', 'SSP3-7.0', 'SSP5-8.5']
+
+# Seasons
+seasons = ['DJF', 'MAM', 'JJA', 'SON']
+
+# NetCDF variable name
+variable_name = "HLI"
+
+# Country shapefile (used for polygons and land mask)
+shapefile_path = (
+    r"C:/Users/PC/Dropbox/IDF_Paper_Last_IPCC_projections/"
+    r"ne_110m_admin_0_countries/ne_110m_admin_0_countries.shp"
+)
+
+# Threshold for "extreme" category (HLI > severe_threshold)
+severe_threshold = 96.0
+
+# If True, negative changes are set to zero (i.e. only show increases)
+ONLY_POSITIVE_CHANGES = True
+
+
+# ============================================================
+# === HELPER FUNCTIONS =======================================
+# ============================================================
+
+def extract_data_from_nc(file_path, variable_name):
+    """
+    Extract latitude, longitude and a 2D variable from a NetCDF file.
+
+    Parameters
+    ----------
+    file_path : str
+        Path to the NetCDF file.
+    variable_name : str
+        Name of the variable to read (e.g. "HLI").
+
+    Returns
+    -------
+    lats : np.ndarray
+        1D array of latitudes (degrees).
+    lons : np.ndarray
+        1D array of longitudes (degrees).
+    data : np.ndarray
+        2D array (lat, lon) of variable values.
+    """
+    with nc.Dataset(file_path, "r") as ds:
+        lats = ds.variables["lat"][:]
+        lons = ds.variables["lon"][:]
+        data = ds.variables[variable_name][:]  # 2D (lat, lon)
+    return lats, lons, data
+
+
+def build_country_raster_and_area(lats, lons, world_gdf):
+    """
+    Rasterize the country polygons and compute the area of each grid cell.
+
+    Parameters
+    ----------
+    lats : np.ndarray
+        1D array of latitudes (degrees).
+    lons : np.ndarray
+        1D array of longitudes (degrees).
+    world_gdf : geopandas.GeoDataFrame
+        Country polygons (e.g. Natural Earth), any CRS.
+
+    Returns
+    -------
+    world_gdf : geopandas.GeoDataFrame
+        Input GeoDataFrame reprojected to WGS84 (EPSG:4326).
+    country_raster : np.ndarray
+        2D array (lat, lon) with integer country indices:
+          -1 = ocean / no country,
+          0..N-1 = index of row in world_gdf.
+    cell_area : np.ndarray
+        2D array (lat, lon) of grid-cell areas in km², computed on
+        a sphere with radius 6,371 km:
+          A = R² × Δλ × [sin(φ + Δφ/2) – sin(φ – Δφ/2)]
+    """
+    # Ensure WGS84 geographic CRS
+    if world_gdf.crs is None:
+        world_gdf = world_gdf.set_crs("EPSG:4326")
+    else:
+        world_gdf = world_gdf.to_crs("EPSG:4326")
+
+    # Grid spacing (assumed regular)
+    x_res = (lons[-1] - lons[0]) / (len(lons) - 1)
+    y_res = (lats[-1] - lats[0]) / (len(lats) - 1)
+
+    # Affine transform for rasterization: origin at lower-left of first cell
+    transform = Affine.translation(
+        lons[0] - x_res / 2, lats[0] - y_res / 2
+    ) * Affine.scale(x_res, y_res)
+
+    # (geometry, value) pairs: value = row index in world_gdf
+    shapes = [(geom, idx) for idx, geom in enumerate(world_gdf.geometry)]
+
+    # Raster of country indices
+    country_raster = features.rasterize(
+        shapes,
+        out_shape=(len(lats), len(lons)),
+        transform=transform,
+        fill=-1,  # ocean / no country
+        dtype=np.int32,
+    )
+
+    # Compute cell area (km²) for each latitude band
+    R = 6371.0  # Earth radius in km
+    dlat_deg = abs(lats[1] - lats[0])
+    dlon_deg = abs(lons[1] - lons[0])
+    dlat = np.deg2rad(dlat_deg)
+    dlon = np.deg2rad(dlon_deg)
+
+    cell_area = np.zeros((len(lats), len(lons)), dtype=np.float64)
+    for i, phi_deg in enumerate(lats):
+        phi = np.deg2rad(phi_deg)
+        area_row = (R ** 2) * dlon * (np.sin(phi + dlat / 2) - np.sin(phi - dlat / 2))
+        cell_area[i, :] = area_row  # km²
+
+    return world_gdf, country_raster, cell_area
+
+
+def compute_country_severe_share(hli_data, country_raster, cell_area, severe_threshold):
+    """
+    Compute, for each country, the percentage of land area with HLI
+    above a given threshold.
+
+    Parameters
+    ----------
+    hli_data : np.ndarray
+        2D array (lat, lon) of HLI values (may contain NaNs).
+    country_raster : np.ndarray
+        2D array (lat, lon) of country indices, as returned by
+        build_country_raster_and_area (>=0 for land, -1 for ocean).
+    cell_area : np.ndarray
+        2D array (lat, lon) of grid-cell areas in km².
+    severe_threshold : float
+        HLI threshold; cells with HLI > severe_threshold are counted.
+
+    Returns
+    -------
+    shares : np.ndarray
+        1D array of length n_countries, containing for each country
+        the percentage (0–100) of its land area where HLI > threshold.
+        Countries with no valid cells receive NaN.
+    """
+    n_countries = country_raster.max() + 1
+    shares = np.full(n_countries, np.nan, dtype=np.float64)
+
+    # Valid cells: belong to a country and have finite HLI values
+    valid_mask = (country_raster >= 0) & np.isfinite(hli_data)
+    severe_mask = valid_mask & (hli_data > severe_threshold)
+
+    for idx in range(n_countries):
+        country_mask = valid_mask & (country_raster == idx)
+        if not np.any(country_mask):
+            continue
+
+        A_tot = cell_area[country_mask].sum()
+        A_severe = cell_area[severe_mask & (country_raster == idx)].sum()
+
+        shares[idx] = (A_severe / A_tot) * 100.0
+
+    return shares
+
+
+def create_delta_subplot(ax, world_gdf, column, title, norm, cmap):
+    """
+    Draw a single map panel for a given season/SSP combination.
+
+    Parameters
+    ----------
+    ax : cartopy.mpl.geoaxes.GeoAxesSubplot
+        Target axis with PlateCarree projection.
+    world_gdf : geopandas.GeoDataFrame
+        Country polygons with a column containing the delta values.
+    column : str
+        Name of the column in world_gdf to be visualised.
+    title : str
+        Title of the subplot (e.g. season).
+    norm : matplotlib.colors.Normalize
+        Normalization for the color scale.
+    cmap : matplotlib colormap
+        Colormap to use.
+    """
+    ax.set_title(title, fontsize=16, fontfamily='serif')
+
+    world_gdf.plot(
+        column=column,
+        ax=ax,
+        transform=ccrs.PlateCarree(),
+        cmap=cmap,
+        norm=norm,
+        edgecolor="black",
+        linewidth=0.4,
+        missing_kwds={
+            "color": "lightgrey",
+            "edgecolor": "black",
+            "hatch": "///",
+            "label": "No data",
+        },
+    )
+
+    gl = ax.gridlines(
+        draw_labels=True,
+        linewidth=0.5,
+        color='gray',
+        alpha=0.5,
+        linestyle='--',
+    )
+    gl.top_labels = False
+    gl.right_labels = False
+    gl.xlabel_style = {
+        'size': 10,
+        'color': 'black',
+        'fontfamily': 'Times New Roman'
+    }
+    gl.ylabel_style = {
+        'size': 10,
+        'color': 'black',
+        'fontfamily': 'Times New Roman'
+    }
+
+    ax.set_extent([-180, 180, -60, 90], crs=ccrs.PlateCarree())
+
+
+# ============================================================
+# === MAIN ===================================================
+# ============================================================
+
+def main():
+    """
+    Main routine.
+
+    Steps
+    -----
+    1. Load the country shapefile and build:
+        - a country index raster aligned with the HLI grid
+        - the corresponding cell-area grid.
+    2. Compute baseline (CliNo) country-level shares of land area
+       with HLI > severe_threshold, separately for each season.
+    3. For the selected period_label and each SSP×season pair,
+       compute the future shares and the difference with respect
+       to CliNo (percentage points).
+    4. Attach these delta values to world_gdf and plot a 4×4 panel
+       (rows = SSPs, columns = seasons) with a common colorbar.
+    """
+
+    # 1) Load country polygons
+    world_gdf = gpd.read_file(shapefile_path)
+
+    # 2) Use one CliNo file as reference grid
+    baseline_ref_file = os.path.join(
+        baseline_dir, "average_HLI_data_DJF_1985_2014.nc"
+    )
+    lats, lons, hli_ref = extract_data_from_nc(baseline_ref_file, variable_name)
+
+    world_gdf, country_raster, cell_area = build_country_raster_and_area(
+        lats, lons, world_gdf
+    )
+
+    # 3) Baseline shares (HLI > threshold) per country and season
+    baseline_shares = {}
+    for season in seasons:
+        file_path = os.path.join(
+            baseline_dir,
+            f"average_HLI_data_{season}_1985_2014.nc"
+        )
+        _, _, hli_baseline = extract_data_from_nc(file_path, variable_name)
+        shares = compute_country_severe_share(
+            hli_baseline, country_raster, cell_area, severe_threshold
+        )
+        baseline_shares[season] = shares
+
+    # 4) Percentage-point deltas for each SSP×season
+    delta_columns = []
+    for ssp in ssp_dirs:
+        for season in seasons:
+            proj_file = os.path.join(
+                projection_dir,
+                ssp,
+                f"projection_{variable_name}_data_{season}_{period_label}.nc"
+            )
+
+            if not os.path.exists(proj_file):
+                print(f"[WARNING] Missing file: {proj_file}")
+                continue
+
+            _, _, hli_proj = extract_data_from_nc(proj_file, variable_name)
+
+            shares_future = compute_country_severe_share(
+                hli_proj, country_raster, cell_area, severe_threshold
+            )
+            shares_baseline = baseline_shares[season]
+
+            # Future – baseline (percentage points)
+            delta = shares_future - shares_baseline
+
+            if ONLY_POSITIVE_CHANGES:
+                delta = np.clip(delta, 0, None)
+
+            col_name = f"{ssp}_{season}_delta"
+            world_gdf[col_name] = delta
+            delta_columns.append(col_name)
+
+    # 5) Common colorbar range (rounded up to nearest multiple of 5 pp)
+    max_delta = np.nanmax([world_gdf[col].values for col in delta_columns])
+    if np.isnan(max_delta) or max_delta <= 0:
+        max_delta_plot = 1.0
+    else:
+        max_delta_plot = max(1.0, np.ceil(max_delta / 5.0) * 5.0)
+
+    cmap = plt.cm.get_cmap("YlOrRd")
+    norm = mpl.colors.Normalize(vmin=0, vmax=max_delta_plot)
+
+    # 6) 4×4 figure: rows = SSPs, columns = seasons
+    fig, axes = plt.subplots(
+        nrows=len(ssp_dirs),
+        ncols=len(seasons),
+        figsize=(20, 16),
+        subplot_kw={'projection': ccrs.PlateCarree()}
+    )
+
+    vertical_space = 0.15
+    ssp_label_distance = -0.15
+    colorbar_distance = 0.06
+    colorbar_shift_right = 0.04
+
+    for row, ssp in enumerate(ssp_dirs):
+        for col, season in enumerate(seasons):
+            ax = axes[row, col]
+            col_name = f"{ssp}_{season}_delta"
+            create_delta_subplot(
+                ax, world_gdf, col_name, title=season, norm=norm, cmap=cmap
+            )
+            # Add SSP label on the left of each row
+            if col == 0:
+                ax.text(
+                    ssp_label_distance, 0.5, ssp,
+                    va='center', ha='right',
+                    fontsize=16, fontweight='bold',
+                    rotation='vertical',
+                    transform=ax.transAxes,
+                    fontfamily='serif'
+                )
+
+    # 7) Single horizontal colorbar
+    cbar_ax = fig.add_axes(
+        [0.20 + colorbar_shift_right, colorbar_distance, 0.6, 0.02]
+    )
+    sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])  # required by Matplotlib
+    cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal')
+
+    cbar.set_label(
+        f"Increase in national land area with HLI > {severe_threshold} (percentage points)",
+        fontsize=14,
+        fontfamily='Times New Roman'
+    )
+    cbar.ax.tick_params(labelsize=12)
+
+    plt.tight_layout(rect=[0.05, 0.1, 1, 0.95 - vertical_space])
+
+    out_name = f"HLI_severe_area_delta_{period_label}.png"
+    plt.savefig(out_name, dpi=600, bbox_inches='tight')
+    plt.show()
+    print(f"Saved figure: {out_name}")
+
+
+if __name__ == "__main__":
+    main()
