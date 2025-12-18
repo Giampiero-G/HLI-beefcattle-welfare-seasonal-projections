@@ -1,0 +1,364 @@
+import os
+import netCDF4 as nc
+import numpy as np
+import geopandas as gpd
+from rasterio import features
+from affine import Affine
+import pandas as pd
+
+"""
+Script: HLI_global_severe_extreme_area_changes.py
+
+Purpose
+-------
+Compute the fraction of global terrestrial area falling into the
+"severe" and "extreme" Heat Load Index (HLI) categories for a
+baseline climatological period and for multiple future time slices
+and SSP scenarios.
+
+For each combination of:
+  - season (DJF, MAM, JJA, SON),
+  - period (2026–2050, 2051–2075, 2076–2100),
+  - SSP scenario (SSP1-2.6, SSP2-4.5, SSP3-7.0, SSP5-8.5),
+
+the script calculates:
+  * baseline share of land area in the "severe" category
+  * future share of land area in the "severe" category
+  * absolute change in severe share (percentage points, pp)
+  * baseline share of land area in the "extreme" category
+  * future share of land area in the "extreme" category
+  * absolute change in extreme share (pp)
+
+Input
+-----
+- Precomputed seasonal HLI NetCDF files for the baseline period:
+    baseline_dir/average_HLI_data_{SEASON}_1985_2014.nc
+
+- Precomputed seasonal HLI NetCDF files for each future period and SSP:
+    projection_periods[period]/{SSP}/projection_HLI_data_{SEASON}_{period}.nc
+
+- A global country shapefile (used only to define a land mask):
+    shapefile_path
+
+Output
+------
+- An Excel file:
+    HLI_global_severe_extreme_area_changes.xlsx
+
+  containing one row for each (period, SSP, season) with baseline/future
+  shares and changes in percentage points.
+
+Notes
+-----
+- Land area is computed on a latitude–longitude grid under a spherical
+  Earth approximation with radius 6,371 km.
+- The percentages are relative to global terrestrial area only
+  (ocean grid cells are excluded via the land mask).
+"""
+
+# ============================================================
+# ========== USER CONFIGURATION ==============================
+# ============================================================
+
+# Directory with baseline seasonal HLI files
+# Expected pattern: average_HLI_data_{SEASON}_1985_2014.nc
+baseline_dir = r"//truenas/dati/Mappe THI e HLI/HLI_CliNO_Season_file_nc/CliNO"
+
+# Projection periods: label -> directory
+# Expected pattern in each directory:
+#   {dir}/{SSP}/projection_HLI_data_{SEASON}_{period_label}.nc
+projection_periods = {
+    "2026_2050": r"//truenas/dati/Mappe THI e HLI/HLI_Projections_file_nc_2026-2050",
+    "2051_2075": r"//truenas/dati/Mappe THI e HLI/HLI_Projections_file_nc_2051-2075",
+    "2076_2100": r"//truenas/dati/Mappe THI e HLI/HLI_Projections_file_nc_2076-2100",
+}
+
+# SSP subfolders within each projection directory
+ssp_dirs = ["SSP1-2.6", "SSP2-4.5", "SSP3-7.0", "SSP5-8.5"]
+
+# Seasons
+seasons = ["DJF", "MAM", "JJA", "SON"]
+
+# Name of the HLI variable in the NetCDF files
+variable_name = "HLI"
+
+# Shapefile used to define the land mask
+# (only the geometry is used; per-country separation is not required here)
+shapefile_path = (
+    r"C:/Users/PC/Dropbox/IDF_Paper_Last_IPCC_projections/"
+    r"ne_110m_admin_0_countries/ne_110m_admin_0_countries.shp"
+)
+
+# HLI thresholds for welfare categories (for reference)
+# moderate:  77 < HLI <= 86
+# severe:    86 < HLI <= 96
+# extreme:   HLI > 96
+SEVERE_LOW = 86.0   # severe if HLI > 86
+SEVERE_HIGH = 96.0  # and HLI <= 96
+EXTREME_LOW = 96.0  # extreme if HLI > 96
+
+
+# ============================================================
+# ========== HELPER FUNCTIONS ================================
+# ============================================================
+
+def extract_data_from_nc(file_path, variable_name):
+    """
+    Read latitude, longitude and a 2D variable from a NetCDF file.
+
+    Parameters
+    ----------
+    file_path : str
+        Path to the NetCDF file.
+    variable_name : str
+        Name of the variable to extract (e.g. "HLI").
+
+    Returns
+    -------
+    lats : np.ndarray
+        1D array of latitudes (degrees).
+    lons : np.ndarray
+        1D array of longitudes (degrees).
+    data : np.ndarray
+        2D array of the target variable with shape (lat, lon).
+    """
+    with nc.Dataset(file_path, "r") as ds:
+        lats = ds.variables["lat"][:]
+        lons = ds.variables["lon"][:]
+        data = ds.variables[variable_name][:]  # 2D (lat, lon)
+    return lats, lons, data
+
+
+def create_land_mask_and_area(lats, lons, shapefile_path):
+    """
+    Build a global land mask and compute the area of each grid cell.
+
+    The land mask is derived by rasterizing a global country shapefile
+    (Natural Earth) onto the target latitude–longitude grid.
+
+    Parameters
+    ----------
+    lats : np.ndarray
+        1D array of latitudes (degrees).
+    lons : np.ndarray
+        1D array of longitudes (degrees).
+    shapefile_path : str
+        Path to the polygon shapefile (e.g. Natural Earth countries).
+
+    Returns
+    -------
+    land_mask : np.ndarray
+        2D array (lat, lon) with values:
+          1 for land,
+          0 for ocean / no country.
+    cell_area : np.ndarray
+        2D array (lat, lon) of cell area in km², computed assuming
+        a spherical Earth with radius 6,371 km, using the cell
+        latitude and the latitudinal/longitudinal grid spacing.
+    """
+    # Read world polygons and ensure WGS84 geographic CRS
+    world = gpd.read_file(shapefile_path)
+    if world.crs is None:
+        world = world.set_crs("EPSG:4326")
+    else:
+        world = world.to_crs("EPSG:4326")
+
+    # Single geometry representing all land
+    land_geom = [world.geometry.union_all()]
+
+    # Grid resolution (assumed regular in lat/lon)
+    x_res = (lons[-1] - lons[0]) / (len(lons) - 1)
+    y_res = (lats[-1] - lats[0]) / (len(lats) - 1)
+
+    # Affine transform: origin at lower-left corner of first cell
+    transform = (
+        Affine.translation(lons[0] - x_res / 2, lats[0] - y_res / 2)
+        * Affine.scale(x_res, y_res)
+    )
+
+    # Rasterize land polygons to 2D grid
+    land_mask = features.rasterize(
+        shapes=land_geom,
+        out_shape=(len(lats), len(lons)),
+        transform=transform,
+        fill=0,
+        default_value=1,
+        dtype=np.uint8,
+    )
+
+    # Compute cell area (km²) on a sphere
+    R = 6371.0  # Earth radius in km
+    dlat_deg = abs(lats[1] - lats[0])
+    dlon_deg = abs(lons[1] - lons[0])
+    dlat = np.deg2rad(dlat_deg)
+    dlon = np.deg2rad(dlon_deg)
+
+    cell_area = np.zeros((len(lats), len(lons)), dtype=np.float64)
+    for i, phi_deg in enumerate(lats):
+        phi = np.deg2rad(phi_deg)
+        # A = R² * Δλ * [sin(φ + Δφ/2) – sin(φ – Δφ/2)]
+        area_row = (R ** 2) * dlon * (np.sin(phi + dlat / 2) - np.sin(phi - dlat / 2))
+        cell_area[i, :] = area_row
+
+    return land_mask, cell_area
+
+
+def compute_global_share_range(hli_data, land_mask, cell_area,
+                               lower=None, upper=None):
+    """
+    Compute the percentage of global land area with HLI in a given range.
+
+    The metric is defined as the fraction of the total terrestrial area
+    (over all land grid cells) whose HLI lies within the specified bounds.
+
+    Parameters
+    ----------
+    hli_data : np.ndarray
+        2D array (lat, lon) of HLI values (may contain NaNs).
+    land_mask : np.ndarray
+        2D array (lat, lon). 1 for land cells, 0 for ocean.
+    cell_area : np.ndarray
+        2D array (lat, lon) of cell areas in km².
+    lower : float or None, optional
+        Lower bound for HLI (strict inequality: HLI > lower).
+        If None, no lower bound is applied.
+    upper : float or None, optional
+        Upper bound for HLI (inclusive: HLI <= upper).
+        If None, no upper bound is applied.
+
+    Returns
+    -------
+    share_percent : float
+        Percentage of global land area (0–100) whose HLI satisfies
+        the given bounds. Returns NaN if no valid land cells are found.
+    """
+    # Land cells with finite HLI values
+    valid_mask = (land_mask == 1) & np.isfinite(hli_data)
+    if not np.any(valid_mask):
+        return np.nan
+
+    # Total terrestrial area
+    A_tot = cell_area[valid_mask].sum()
+
+    # Selection mask for the desired HLI range
+    mask = valid_mask.copy()
+    if lower is not None:
+        mask &= (hli_data > lower)
+    if upper is not None:
+        mask &= (hli_data <= upper)
+
+    A_sel = cell_area[mask].sum()
+
+    return (A_sel / A_tot) * 100.0
+
+
+# ============================================================
+# ========== MAIN ============================================
+# ============================================================
+
+def main():
+    """
+    Main execution routine.
+
+    1. Build land mask and cell-area grid from the baseline DJF file.
+    2. Compute baseline (CliNo) shares of "severe" and "extreme"
+       HLI categories for each season.
+    3. For each future period and SSP scenario, compute the
+       corresponding shares and their absolute changes (pp).
+    4. Export the resulting table to an Excel file.
+    """
+
+    # 1) Reference grid + land mask + cell area from baseline DJF file
+    ref_file = os.path.join(baseline_dir, "average_HLI_data_DJF_1985_2014.nc")
+    lats, lons, _ = extract_data_from_nc(ref_file, variable_name)
+    land_mask, cell_area = create_land_mask_and_area(lats, lons, shapefile_path)
+
+    # 2) Baseline shares for each season (severe and extreme separately)
+    baseline_severe_share = {}   # season -> %
+    baseline_extreme_share = {}  # season -> %
+
+    for season in seasons:
+        file_path = os.path.join(
+            baseline_dir,
+            f"average_HLI_data_{season}_1985_2014.nc",
+        )
+        _, _, hli_baseline = extract_data_from_nc(file_path, variable_name)
+
+        # severe: 86 < HLI <= 96
+        severe_share = compute_global_share_range(
+            hli_baseline, land_mask, cell_area,
+            lower=SEVERE_LOW, upper=SEVERE_HIGH
+        )
+
+        # extreme: HLI > 96
+        extreme_share = compute_global_share_range(
+            hli_baseline, land_mask, cell_area,
+            lower=EXTREME_LOW, upper=None
+        )
+
+        baseline_severe_share[season] = severe_share
+        baseline_extreme_share[season] = extreme_share
+
+    # 3) Loop over periods, SSPs and seasons to compute future shares and deltas
+    rows = []
+    for period_label, proj_dir in projection_periods.items():
+        for ssp in ssp_dirs:
+            for season in seasons:
+                proj_file = os.path.join(
+                    proj_dir,
+                    ssp,
+                    f"projection_{variable_name}_data_{season}_{period_label}.nc",
+                )
+                if not os.path.exists(proj_file):
+                    print(f"[WARNING] Missing file: {proj_file}")
+                    continue
+
+                _, _, hli_proj = extract_data_from_nc(proj_file, variable_name)
+
+                # Future severe & extreme shares
+                severe_future = compute_global_share_range(
+                    hli_proj, land_mask, cell_area,
+                    lower=SEVERE_LOW, upper=SEVERE_HIGH
+                )
+                extreme_future = compute_global_share_range(
+                    hli_proj, land_mask, cell_area,
+                    lower=EXTREME_LOW, upper=None
+                )
+
+                # Corresponding baseline (same season)
+                severe_base = baseline_severe_share[season]
+                extreme_base = baseline_extreme_share[season]
+
+                # Changes in percentage points (future – baseline)
+                delta_severe_pp = severe_future - severe_base
+                delta_extreme_pp = extreme_future - extreme_base
+
+                rows.append(
+                    {
+                        "Period": period_label,
+                        "SSP": ssp,
+                        "Season": season,
+                        "Baseline_severe_share_%": severe_base,
+                        "Future_severe_share_%": severe_future,
+                        "Delta_severe_pp": delta_severe_pp,
+                        "Baseline_extreme_share_%": extreme_base,
+                        "Future_extreme_share_%": extreme_future,
+                        "Delta_extreme_pp": delta_extreme_pp,
+                    }
+                )
+
+    # 4) Build final table and export to Excel
+    df = pd.DataFrame(rows)
+    df = df.sort_values(["Period", "SSP", "Season"])
+
+    print(df)
+
+    out_xlsx = "HLI_global_severe_extreme_area_changes.xlsx"
+    df.to_excel(out_xlsx, index=False)
+    print(f"\nTable saved to: {out_xlsx}")
+
+
+if __name__ == "__main__":
+    main()
+
+
