@@ -94,7 +94,7 @@ def calculate_T_bg(tas, rsds):
     tas_c_sqrt = np.sqrt(np.maximum(tas_c, 0))
     rsds = np.clip(rsds, epsilon, 1000)
 
-    T_bg = 1.33 * tas_c - 2.65 * tas_c_sqrt + 3.21 * np.log(rsds + 1) + 3.5
+    T_bg = 1.33 * tas_c - 2.65 * tas_c_sqrt + 3.21 * np.log10(rsds + 1) + 3.5
     return np.clip(T_bg, -100, 100)
 
 
